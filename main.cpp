@@ -1,8 +1,22 @@
 #include <string>
 #include <cstdio>
+#include <map>
+#include <fstream>
 #include <vector>
 #include <exception>
 #include <functional>
+
+#include <llvm/ADT/APFloat.h>
+#include <llvm/ADT/STLExtras.h>
+#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Type.h>
+#include <llvm/IR/Verifier.h>
 
 namespace KaleidoScope {
 
@@ -10,6 +24,8 @@ namespace KaleidoScope {
   #define ispound(x) ('#' == (x))
   #define iseof(x) (EOF == (x))
   #define isterminator(x) (EOF == (x) || '\r' == (x) || '\n' == (x))
+
+  #define log(message, ...) printf(message"\n", ##__VA_ARGS__)
 
   enum Token {
     // 0-255 represent the input characters themselves
@@ -29,10 +45,51 @@ namespace KaleidoScope {
     op_lt
   };
 
-  class ExprAST {
+  class IRBag {
+    llvm::LLVMContext context;
+    llvm::Module module;
+    llvm::IRBuilder<> builder;
+    std::map<std::string, llvm::Value*> var_map;
+
+    public:
+    IRBag(): context(), module("The jit", context), builder(context) {}
+
+    llvm::LLVMContext& get_context() {
+      return context;
+    }
+
+    llvm::Module& get_module() {
+      return module;
+    }
+
+    llvm::IRBuilder<>& get_builder() {
+      return builder;
+    }
+
+    void clear_vars() {
+      var_map.clear();
+    }
+
+    llvm::Value* get_var(const std::string& name) {
+      return var_map[name];
+    }
+
+    void set_var(const std::string& name, llvm::Value* value) {
+      var_map[name] = value;
+    }
+  };
+
+  class AST {
+    public:
+    virtual ~AST() = default;
+    virtual llvm::Value* to_llvm_ir(IRBag& ir_bag) = 0;
+  };
+
+  class ExprAST: public AST {
     public:
     ExprAST() {}
     virtual ~ExprAST() = default;
+    virtual std::string dump() = 0;
   };
 
   class NumberExprAST: public ExprAST {
@@ -40,6 +97,14 @@ namespace KaleidoScope {
 
     public:
     NumberExprAST(double value): value(value) {}
+
+    llvm::Value* to_llvm_ir(IRBag& ir_bag) override {
+      return llvm::ConstantFP::get(ir_bag.get_context(), llvm::APFloat(value));
+    }
+
+    std::string dump() override {
+      return "NumberExprAST: " + std::to_string(value);
+    }
   };
 
   class VarExprAST: public ExprAST {
@@ -47,6 +112,19 @@ namespace KaleidoScope {
 
     public:
     VarExprAST(std::string name): name(name) {}
+
+    llvm::Value* to_llvm_ir(IRBag& ir_bag) override {
+      if (llvm::Value* v = ir_bag.get_var(name)) {
+        return v;
+      }
+
+      log("ERROR: Cannot find the variable: %s", name.c_str());
+      return nullptr;
+    }
+
+    std::string dump() override {
+      return "VarExprAST: " + name;
+    }
   };
 
   class BinaryExprAST: public ExprAST {
@@ -61,6 +139,35 @@ namespace KaleidoScope {
                   op(op),
                   lhs(std::move(lhs)),
                   rhs(std::move(rhs)) {}
+
+    llvm::Value* to_llvm_ir(IRBag& ir_bag) override {
+      llvm::Value* lhs = this->lhs->to_llvm_ir(ir_bag);
+      llvm::Value* rhs = this->rhs->to_llvm_ir(ir_bag);
+
+      switch (op) {
+        case op_add: {
+          return ir_bag.get_builder().CreateFAdd(lhs, rhs, "add_tmp");
+        }
+        case op_sub: {
+          return ir_bag.get_builder().CreateFSub(lhs, rhs, "sub_tmp");
+        }
+        case op_mul: {
+          return ir_bag.get_builder().CreateFMul(lhs, rhs, "mul_tmp");
+        }
+        case op_lt: {
+          llvm::Value* cmp = ir_bag.get_builder().CreateFCmpULT(lhs, rhs, "cmp_tmp");
+          return ir_bag.get_builder().CreateUIToFP(cmp, llvm::Type::getDoubleTy(ir_bag.get_context()), "cmp_tmp_1");
+        }
+        default: {
+          log("Error: Cannot convert op to LLVM IR");
+          return nullptr;
+        }
+      }
+    }
+
+    std::string dump() override {
+      return "" + std::to_string(op) + lhs->dump() + rhs->dump();
+    }
   };
 
   class CallExprAST: public ExprAST {
@@ -72,9 +179,37 @@ namespace KaleidoScope {
                 std::vector<std::unique_ptr<ExprAST>> args):
                 callee(callee),
                 args(std::move(args)) {}
+
+    llvm::Value* to_llvm_ir(IRBag& ir_bag) override {
+      std::vector<llvm::Value*> args;
+      llvm::Function* func = ir_bag.get_module().getFunction(callee);
+
+      if (func->arg_size() != this->args.size()) {
+        log("Error: Argument mismatch: func: %zu, args: %zu", func->arg_size(), this->args.size());
+        return nullptr;
+      }
+
+      for (int i = 0; i < this->args.size(); i++) {
+        args.push_back(this->args[i]->to_llvm_ir(ir_bag));
+      }
+
+      return ir_bag.get_builder().CreateCall(func, args, "call_tmp");
+    }
+
+    std::string dump() override {
+      std::string info = "";
+
+      info += callee;
+
+      for (auto &arg: args) {
+        info += (" " + arg->dump());
+      }
+
+      return info;
+    }
   };
 
-  class FunctionAST {
+  class FunctionAST: public AST {
     std::string name;
     std::vector<std::string> args;
     std::unique_ptr<ExprAST> body;
@@ -86,9 +221,44 @@ namespace KaleidoScope {
                 name(name),
                 args(args),
                 body(std::move(body)) {}
+
+    llvm::Value* to_llvm_ir(IRBag& ir_bag) override {
+      std::vector<llvm::Type*> arg_types(args.size(), llvm::Type::getDoubleTy(ir_bag.get_context()));
+      llvm::FunctionType* func_type = llvm::FunctionType::get(llvm::Type::getDoubleTy(ir_bag.get_context()), arg_types, false);
+
+      llvm::Function* func = llvm::Function::Create(func_type, llvm::Function::ExternalLinkage, name, ir_bag.get_module());
+
+      {
+        unsigned idx = 0;
+
+        for (auto& arg: func->args()) {
+          arg.setName(args[idx]);
+          idx += 1;
+        }
+      }
+
+      llvm::BasicBlock *bb = llvm::BasicBlock::Create(ir_bag.get_context(), name, func);
+
+      ir_bag.get_builder().SetInsertPoint(bb);
+
+      ir_bag.clear_vars();
+
+      for (auto &arg : func->args()) {
+        // log("dbg: setting arg: %s", std::string(arg.getName()).c_str());
+        ir_bag.set_var(std::string(arg.getName()), &arg);
+      }
+
+      if (llvm::Value* ret_val = body->to_llvm_ir(ir_bag)) {
+        ir_bag.get_builder().CreateRet(ret_val);
+        return func;
+      }
+
+      func->eraseFromParent();
+      return nullptr;
+    }
   };
 
-  class ExternAST {
+  class ExternAST: public AST {
     std::string name;
     std::vector<std::string> args;
 
@@ -97,6 +267,24 @@ namespace KaleidoScope {
               std::vector<std::string> args):
               name(name),
               args(args) {}
+
+    llvm::Value* to_llvm_ir(IRBag& ir_bag) override {
+      std::vector<llvm::Type*> arg_types(this->args.size(), llvm::Type::getDoubleTy(ir_bag.get_context()));
+      llvm::FunctionType* func_type = llvm::FunctionType::get(llvm::Type::getDoubleTy(ir_bag.get_context()), arg_types, false);
+
+      llvm::Function* func = llvm::Function::Create(func_type, llvm::Function::ExternalLinkage, name, ir_bag.get_module());
+
+      {
+        unsigned idx = 0;
+
+        for (auto& arg: func->args()) {
+          arg.setName(args[idx]);
+          idx += 1;
+        }
+      }
+
+      return func;
+    }
   };
 
   class Compiler {
@@ -112,10 +300,6 @@ namespace KaleidoScope {
                                             current_token(tok_none) {}
 
     ~Compiler() {}
-
-    void log(const std::string &message) {
-      printf("%s", message.c_str());
-    }
 
     int get_next_token() {
       return current_token = get_token();
@@ -199,16 +383,22 @@ namespace KaleidoScope {
 
         std::vector<std::unique_ptr<ExprAST>> args;
 
-        while (current_token != ')') {
+        while (true) {
           if (std::unique_ptr<ExprAST> expr = parse_expression()) {
+            // log("dbg: parsed arg: %s", expr->dump().c_str());
+
             args.push_back(std::move(expr));
           } else {
             log("Error: Cannot parse argument expression");
             return nullptr;
           }
 
+          if (current_token == ')') {
+            break;
+          }
+
           if (current_token != ',') {
-            log("Error: Expecting , between consecutive argument");
+            log("Error: Expecting , between consecutive argument, found: %d (%c)", current_token, (char) current_token);
             return nullptr;
           }
 
@@ -220,7 +410,6 @@ namespace KaleidoScope {
         return std::make_unique<CallExprAST>(name, std::move(args));
       } else {
         // variable
-        get_next_token();
         return std::make_unique<VarExprAST>(name);
       }
     }
@@ -244,7 +433,7 @@ namespace KaleidoScope {
       }
 
       if (current_token != ')') {
-        log("Error: Expecting )");
+        log("Error: Expecting ), found: %d (%c)", current_token, (char) current_token);
         return nullptr;
       }
 
@@ -283,6 +472,25 @@ namespace KaleidoScope {
       return std::make_unique<ExternAST>(name, args);
     }
 
+    std::unique_ptr<ExprAST> parse_parenthesis() {
+      get_next_token();
+
+      auto expr = parse_expression();
+
+      if (!expr) {
+        log("Error: Cannot parse parenthesis expression");
+        return nullptr;
+      }
+
+      if (current_token != ')') {
+        log("Error: expecting )");
+        return nullptr;
+      }
+
+      get_next_token();
+      return expr;
+    }
+
     std::unique_ptr<ExprAST> parse_primary() {
       switch (current_token) {
         case tok_identifier: {
@@ -291,8 +499,11 @@ namespace KaleidoScope {
         case tok_number: {
           return parse_number();
         }
+        case '(': {
+          return parse_parenthesis();
+        }
         default: {
-          log("illegal token");
+          log("illegal token: %d (%c)", current_token, (char) current_token);
           return nullptr;
         }
       }
@@ -362,6 +573,8 @@ namespace KaleidoScope {
 
         Operation bin_op = convert_to_op(current_token);
 
+        get_next_token();
+
         auto rhs = parse_primary();
 
         if (!rhs) {
@@ -398,6 +611,53 @@ namespace KaleidoScope {
 
     void compile() {
       int tok;
+      IRBag ir_bag;
+
+      get_next_token();
+
+      while (true) {
+        switch (current_token) {
+          case tok_eof: {
+            return;
+          }
+          case ';':
+          case tok_none: {
+            get_next_token();
+            break;
+          }
+          case tok_def: {
+            auto fn_ast = parse_definiton();
+            auto fn_ir = fn_ast->to_llvm_ir(ir_bag);
+
+            fn_ir->print(llvm::errs());
+            fprintf(stderr, "\n");
+            break;
+          }
+          case tok_extern: {
+            auto fn_ast = parse_extern();
+            auto fn_ir = fn_ast->to_llvm_ir(ir_bag);
+
+            fn_ir->print(llvm::errs());
+            fprintf(stderr, "\n");
+            break;
+          }
+          default: {
+            // parse for an anonymous expression
+            if (auto expr = parse_expression()) {
+              auto fn_ast = std::make_unique<FunctionAST>("__anon_expr", std::vector<std::string>(), std::move(expr));
+
+              auto fn_ir = fn_ast->to_llvm_ir(ir_bag);
+
+              fn_ir->print(llvm::errs());
+              fprintf(stderr, "\n");
+            } else {
+              log("Error: Cannot parse anonymous expression");
+            }
+
+            break;
+          }
+        }
+      }
 
       while (tok_eof != (tok = get_token())) {
         printf("%d\n", tok);
@@ -406,8 +666,21 @@ namespace KaleidoScope {
   };
 }
 
-int main() {
-  KaleidoScope::Compiler c([] { return getchar(); });
+int main(int argc, char **argv) {
+  if (2 != argc) {
+    log("Error: input file needs to be passed");
+    return -1;
+  }
+
+  const char* source = argv[1];
+  std::ifstream input(source);
+
+  if (!input) {
+    log("Error: Cannot open the input file");
+    return -2;
+  }
+
+  KaleidoScope::Compiler c([&input] { char c; if (input.get(c)) { return c; } else { return (char) EOF; } });
 
   c.compile();
 }
