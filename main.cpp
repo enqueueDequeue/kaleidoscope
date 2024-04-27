@@ -1,4 +1,5 @@
 #include <string>
+#include <iostream>
 #include <cstdio>
 #include <map>
 #include <fstream>
@@ -17,6 +18,27 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/IR/DataLayout.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Passes/StandardInstrumentations.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Scalar/GVN.h>
+#include <llvm/Transforms/Scalar/Reassociate.h>
+#include <llvm/Transforms/Scalar/SimplifyCFG.h>
+#include <llvm/Support/Error.h>
+#include <llvm/MC/TargetRegistry.h>
+#include <llvm/ExecutionEngine/SectionMemoryManager.h>
+#include <llvm/ExecutionEngine/Orc/Core.h>
+#include <llvm/ExecutionEngine/Orc/CompileUtils.h>
+#include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
+#include <llvm/ExecutionEngine/Orc/IRCompileLayer.h>
+#include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
+#include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
+#include <llvm/ExecutionEngine/Orc/ExecutorProcessControl.h>
+#include <llvm/IR/LegacyPassManager.h>
 
 namespace KaleidoScope {
 
@@ -45,6 +67,57 @@ namespace KaleidoScope {
     op_lt
   };
 
+  class JITBag {
+    std::unique_ptr<llvm::orc::ExecutionSession> es;
+    llvm::Triple target_triple;
+    llvm::DataLayout data_layout;
+    llvm::orc::RTDyldObjectLinkingLayer object_layer;
+    llvm::orc::IRCompileLayer compile_layer;
+    llvm::orc::JITDylib& main_jd;
+
+    JITBag(std::unique_ptr<llvm::orc::ExecutionSession> es,
+           llvm::Triple target_triple,
+           llvm::DataLayout data_layout,
+           llvm::orc::JITTargetMachineBuilder jtmb):
+           es(std::move(es)),
+           target_triple(std::move(target_triple)),
+           data_layout(std::move(data_layout)),
+           object_layer(*this->es, []() { return std::make_unique<llvm::SectionMemoryManager>(); }),
+           compile_layer(*this->es, object_layer, std::make_unique<llvm::orc::ConcurrentIRCompiler>(std::move(jtmb))),
+           main_jd(this->es->createBareJITDylib("<main>")) {
+
+      main_jd.addGenerator(llvm::cantFail(llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(data_layout.getGlobalPrefix())));
+    }
+
+    public:
+    ~JITBag() {
+      if (llvm::Error err = es->endSession()) {
+        es->reportError(std::move(err));
+      }
+    }
+
+    static JITBag create() {
+      llvm::InitializeNativeTarget();
+
+      std::unique_ptr<llvm::orc::SelfExecutorProcessControl> epc = llvm::cantFail(llvm::orc::SelfExecutorProcessControl::Create());
+      std::unique_ptr<llvm::orc::ExecutionSession> es = std::make_unique<llvm::orc::ExecutionSession>(std::move(epc));
+
+      llvm::Triple target_triple = es->getExecutorProcessControl().getTargetTriple();
+      llvm::orc::JITTargetMachineBuilder jtmb(target_triple);
+      llvm::DataLayout data_layout = llvm::cantFail(jtmb.getDefaultDataLayoutForTarget());
+
+      return JITBag(std::move(es), std::move(target_triple), std::move(data_layout), std::move(jtmb));
+    }
+
+    const llvm::Triple& get_target_triple() const {
+      return target_triple;
+    }
+
+    const llvm::DataLayout& get_data_layout() const {
+      return data_layout;
+    }
+  };
+
   class IRBag {
     llvm::LLVMContext context;
     llvm::Module module;
@@ -52,7 +125,29 @@ namespace KaleidoScope {
     std::map<std::string, llvm::Value*> var_map;
 
     public:
-    IRBag(): context(), module("The jit", context), builder(context) {}
+    llvm::FunctionPassManager fpm;
+    llvm::LoopAnalysisManager lam;
+    llvm::FunctionAnalysisManager fam;
+    llvm::CGSCCAnalysisManager cgam;
+    llvm::ModuleAnalysisManager mam;
+    llvm::PassInstrumentationCallbacks pic;
+    llvm::StandardInstrumentations si;
+    llvm::PassBuilder pb;
+
+    IRBag(JITBag& jit_bag): context(), module("The jit", context), builder(context), si(context, true) {
+      module.setDataLayout(jit_bag.get_data_layout());
+
+      si.registerCallbacks(pic, &mam);
+
+      fpm.addPass(llvm::InstCombinePass());
+      fpm.addPass(llvm::ReassociatePass());
+      fpm.addPass(llvm::GVNPass());
+      fpm.addPass(llvm::SimplifyCFGPass());
+
+      pb.registerModuleAnalyses(mam);
+      pb.registerFunctionAnalyses(fam);
+      pb.crossRegisterProxies(lam, fam, cgam, mam);
+    }
 
     llvm::LLVMContext& get_context() {
       return context;
@@ -250,6 +345,9 @@ namespace KaleidoScope {
 
       if (llvm::Value* ret_val = body->to_llvm_ir(ir_bag)) {
         ir_bag.get_builder().CreateRet(ret_val);
+
+        ir_bag.fpm.run(*func, ir_bag.fam);
+
         return func;
       }
 
@@ -609,9 +707,8 @@ namespace KaleidoScope {
       return nullptr;
     }
 
-    void compile() {
+    void compile(IRBag& ir_bag) {
       int tok;
-      IRBag ir_bag;
 
       get_next_token();
 
@@ -642,45 +739,83 @@ namespace KaleidoScope {
             break;
           }
           default: {
-            // parse for an anonymous expression
-            if (auto expr = parse_expression()) {
-              auto fn_ast = std::make_unique<FunctionAST>("__anon_expr", std::vector<std::string>(), std::move(expr));
+            log("Top Level functions not supported yet");
 
-              auto fn_ir = fn_ast->to_llvm_ir(ir_bag);
+            // // parse for an anonymous expression
+            // if (auto expr = parse_expression()) {
+            //   auto fn_ast = std::make_unique<FunctionAST>("__anon_expr", std::vector<std::string>(), std::move(expr));
 
-              fn_ir->print(llvm::errs());
-              fprintf(stderr, "\n");
-            } else {
-              log("Error: Cannot parse anonymous expression");
-            }
+            //   auto fn_ir = fn_ast->to_llvm_ir(ir_bag);
+
+            //   fn_ir->print(llvm::errs());
+            //   fprintf(stderr, "\n");
+            // } else {
+            //   log("Error: Cannot parse anonymous expression");
+            // }
 
             break;
           }
         }
-      }
-
-      while (tok_eof != (tok = get_token())) {
-        printf("%d\n", tok);
       }
     }
   };
 }
 
 int main(int argc, char **argv) {
-  if (2 != argc) {
-    log("Error: input file needs to be passed");
+  if (3 != argc) {
+    log("Error: input & output file needs to be passed");
     return -1;
   }
 
-  const char* source = argv[1];
-  std::ifstream input(source);
+  const char* src = argv[1];
+  const char* dst = argv[2];
+  std::ifstream input(src);
+
+  std::error_code output_ec;
+  llvm::raw_fd_ostream output(dst, output_ec, llvm::sys::fs::OF_None);
 
   if (!input) {
     log("Error: Cannot open the input file");
     return -2;
   }
 
+  if (output_ec) {
+    log("Error: Cannot open the output file");
+    return -3;
+  }
+
+  KaleidoScope::JITBag jit_bag = KaleidoScope::JITBag::create();
+
+  KaleidoScope::IRBag ir_bag(jit_bag);
+
   KaleidoScope::Compiler c([&input] { char c; if (input.get(c)) { return c; } else { return (char) EOF; } });
 
-  c.compile();
+  c.compile(ir_bag);
+
+  llvm::TargetOptions options;
+  llvm::Triple target_triple = jit_bag.get_target_triple();
+
+  llvm::InitializeAllTargetInfos();
+  llvm::InitializeAllTargets();
+  llvm::InitializeAllTargetMCs();
+  llvm::InitializeAllAsmParsers();
+  llvm::InitializeAllAsmPrinters();
+
+  std::string error;
+  const llvm::Target* target = llvm::TargetRegistry::lookupTarget(target_triple.getArchName(), target_triple, error);
+  llvm::TargetMachine* target_machine = target->createTargetMachine(target_triple.getTriple(), "generic", "", options, llvm::Reloc::PIC_);
+
+  ir_bag.get_module().setDataLayout(target_machine->createDataLayout());
+
+  llvm::legacy::PassManager pass;
+
+  if (target_machine->addPassesToEmitFile(pass, output, nullptr, llvm::CodeGenFileType::CGFT_ObjectFile)) {
+    log("Error: Cannot output to file");
+    return -4;
+  }
+
+  pass.run(ir_bag.get_module());
+  output.flush();
+
+  return 0;
 }
