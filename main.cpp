@@ -56,7 +56,12 @@ namespace KaleidoScope {
     tok_extern = -3,
     tok_identifier = -4,
     tok_number = -5,
-    tok_none = -6
+    tok_none = -6,
+    tok_if = -7,
+    tok_then = -8,
+    tok_else = -9,
+    tok_for = -10,
+    tok_in = -11
   };
 
   enum Operation {
@@ -166,11 +171,17 @@ namespace KaleidoScope {
     }
 
     llvm::Value* get_var(const std::string& name) {
+      // log("Getting name: %s", name.c_str());
       return var_map[name];
     }
 
     void set_var(const std::string& name, llvm::Value* value) {
+      // log("Setting name: %s", name.c_str());
       var_map[name] = value;
+    }
+
+    void erase_var(const std::string& name) {
+      var_map.erase(name);
     }
   };
 
@@ -251,7 +262,7 @@ namespace KaleidoScope {
         }
         case op_lt: {
           llvm::Value* cmp = ir_bag.get_builder().CreateFCmpULT(lhs, rhs, "cmp_tmp");
-          return ir_bag.get_builder().CreateUIToFP(cmp, llvm::Type::getDoubleTy(ir_bag.get_context()), "cmp_tmp_1");
+          return ir_bag.get_builder().CreateUIToFP(cmp, llvm::Type::getDoubleTy(ir_bag.get_context()), "bool_tmp");
         }
         default: {
           log("Error: Cannot convert op to LLVM IR");
@@ -346,7 +357,9 @@ namespace KaleidoScope {
       if (llvm::Value* ret_val = body->to_llvm_ir(ir_bag)) {
         ir_bag.get_builder().CreateRet(ret_val);
 
-        ir_bag.fpm.run(*func, ir_bag.fam);
+        llvm::verifyFunction(*func);
+
+        // ir_bag.fpm.run(*func, ir_bag.fam);
 
         return func;
       }
@@ -385,6 +398,193 @@ namespace KaleidoScope {
     }
   };
 
+  class IfExprAST: public ExprAST {
+    std::unique_ptr<ExprAST> cond;
+    std::unique_ptr<ExprAST> then;
+    std::unique_ptr<ExprAST> otherwise;
+
+    public:
+    IfExprAST(std::unique_ptr<ExprAST> cond,
+              std::unique_ptr<ExprAST> then,
+              std::unique_ptr<ExprAST> otherwise):
+              cond(std::move(cond)),
+              then(std::move(then)),
+              otherwise(std::move(otherwise)) {}
+
+    llvm::Value* to_llvm_ir(IRBag& ir_bag) override {
+      llvm::Value* cond_value = cond->to_llvm_ir(ir_bag);
+
+      // 1. create the condition
+      // FCmpONE = float compare ordered(?) not equals
+      llvm::Value* cmp_value = ir_bag.get_builder().CreateFCmpONE(cond_value,
+                                                    llvm::ConstantFP::get(ir_bag.get_context(), llvm::APFloat(0.0)),
+                                                    "cond");
+
+      llvm::Function* parent_function = ir_bag.get_builder().GetInsertBlock()->getParent();
+
+      llvm::BasicBlock* then_block = llvm::BasicBlock::Create(ir_bag.get_context(), "if.then");
+      llvm::BasicBlock* otherwise_block = llvm::BasicBlock::Create(ir_bag.get_context(), "if.otherwise");
+      llvm::BasicBlock* merge_block = llvm::BasicBlock::Create(ir_bag.get_context(), "if.finally");
+
+      // 2. create the branch
+      ir_bag.get_builder().CreateCondBr(cmp_value, then_block, otherwise_block);
+
+      // 3. create the then block
+      parent_function->insert(parent_function->end(), then_block);
+      ir_bag.get_builder().SetInsertPoint(then_block);
+
+      // this will be inserted automatically
+      // this will also be used during the disambiguation in the phi node
+      llvm::Value* then_value = then->to_llvm_ir(ir_bag);
+
+      // the jmp instruction after a branch
+      ir_bag.get_builder().CreateBr(merge_block);
+
+      // During the code generation, the basic block pointers might change
+      // So, get the new pointer again
+      then_block = ir_bag.get_builder().GetInsertBlock();
+
+      // 4. create the else block
+      parent_function->insert(parent_function->end(), otherwise_block);
+      ir_bag.get_builder().SetInsertPoint(otherwise_block);
+
+      llvm::Value* otherwise_value = otherwise->to_llvm_ir(ir_bag);
+
+      ir_bag.get_builder().CreateBr(merge_block);
+
+      otherwise_block = ir_bag.get_builder().GetInsertBlock();
+
+      // 5. create the merge block
+      parent_function->insert(parent_function->end(), merge_block);
+
+      ir_bag.get_builder().SetInsertPoint(merge_block);
+
+      llvm::PHINode* phi_node = ir_bag.get_builder().CreatePHI(llvm::Type::getDoubleTy(ir_bag.get_context()), 2);
+
+      phi_node->addIncoming(then_value, then_block);
+      phi_node->addIncoming(otherwise_value, otherwise_block);
+
+      return phi_node;
+    }
+
+    std::string dump() override {
+      std::string info;
+
+      info += "if (" + cond->dump() + "):";
+      info += then->dump();
+      info += "else:";
+      info += otherwise->dump();
+
+      return info;
+    }
+  };
+
+  class ForExprAST: public ExprAST {
+    std::string name;
+    std::unique_ptr<ExprAST> start;
+    std::unique_ptr<ExprAST> end;
+    std::unique_ptr<ExprAST> step;
+    std::unique_ptr<ExprAST> body;
+
+    public:
+    ForExprAST(std::string name,
+               std::unique_ptr<ExprAST> start,
+               std::unique_ptr<ExprAST> end,
+               std::unique_ptr<ExprAST> step,
+               std::unique_ptr<ExprAST> body):
+               name(name),
+               start(std::move(start)),
+               end(std::move(end)),
+               step(std::move(step)),
+               body(std::move(body)) {}
+
+    llvm::Value* to_llvm_ir(IRBag& ir_bag) override {
+      llvm::Function* parent_function = ir_bag.get_builder().GetInsertBlock()->getParent();
+
+      llvm::BasicBlock* header_block = ir_bag.get_builder().GetInsertBlock();
+      llvm::BasicBlock* cond_block = llvm::BasicBlock::Create(ir_bag.get_context(), "for.cond");
+      llvm::BasicBlock* body_block = llvm::BasicBlock::Create(ir_bag.get_context(), "for.body");
+      llvm::BasicBlock* finally_block = llvm::BasicBlock::Create(ir_bag.get_context(), "for.finally");
+
+      // header block begin
+      llvm::Value* start_value = start->to_llvm_ir(ir_bag);
+      ir_bag.get_builder().CreateBr(cond_block);
+
+      header_block = ir_bag.get_builder().GetInsertBlock();
+
+      // cond block begin
+      parent_function->insert(parent_function->end(), cond_block);
+      ir_bag.get_builder().SetInsertPoint(cond_block);
+
+      llvm::PHINode* loop_idx = ir_bag.get_builder().CreatePHI(llvm::Type::getDoubleTy(ir_bag.get_context()), 2);
+
+      llvm::Value* old_value = ir_bag.get_var(name);
+      ir_bag.set_var(name, loop_idx);
+
+      // this is actually the condition
+      // 0.0 means false, anything else is true
+      llvm::Value* end_value = end->to_llvm_ir(ir_bag);
+      llvm::Value* cond_value = ir_bag.get_builder().CreateFCmpONE(end_value,
+                                                                   llvm::ConstantFP::get(ir_bag.get_context(), llvm::APFloat(0.0)),
+                                                                   "cond");
+
+      ir_bag.get_builder().CreateCondBr(cond_value, body_block, finally_block);
+
+      // body block begin
+      parent_function->insert(parent_function->end(), body_block);
+      ir_bag.get_builder().SetInsertPoint(body_block);
+
+      llvm::Value* body_value = body->to_llvm_ir(ir_bag);
+
+      if (!body_value) {
+        log("Error: Cannot generate the body");
+        return nullptr;
+      }
+
+      llvm::Value* step_value = step->to_llvm_ir(ir_bag);
+
+      llvm::Value* next_idx = ir_bag.get_builder().CreateFAdd(loop_idx, step_value, "next_idx");
+
+      ir_bag.get_builder().CreateBr(cond_block);
+
+      body_block = ir_bag.get_builder().GetInsertBlock();
+
+      loop_idx->addIncoming(start_value, header_block);
+      loop_idx->addIncoming(next_idx, body_block);
+
+      // exit block begin
+      // finally block doesn't have any instrctions
+      // this is for the next parsers to insert into
+      parent_function->insert(parent_function->end(), finally_block);
+
+      ir_bag.get_builder().SetInsertPoint(finally_block);
+
+      if (old_value) {
+        ir_bag.set_var(name, old_value);
+      } else {
+        ir_bag.erase_var(name);
+      }
+
+      return llvm::Constant::getNullValue(llvm::Type::getDoubleTy(ir_bag.get_context()));
+    }
+
+    std::string dump() override {
+      std::string info;
+
+      info += "for(" + name + "=";
+      info += start->dump();
+      info += ", ";
+      info += end->dump();
+      info += ", ";
+      info += step->dump();
+      info += " in ";
+      info += body->dump();
+      info += ";";
+
+      return info;
+    }
+  };
+
   class Compiler {
     std::function<char()> read;
     std::string input;
@@ -420,6 +620,16 @@ namespace KaleidoScope {
           return tok_def;
         } else if (input == "extern") {
           return tok_extern;
+        } else if (input == "if") {
+          return tok_if;
+        } else if (input == "then") {
+          return tok_then;
+        } else if (input == "else") {
+          return tok_else;
+        } else if (input == "for") {
+          return tok_for;
+        } else if (input == "in") {
+          return tok_in;
         } else {
           return tok_identifier;
         }
@@ -453,6 +663,104 @@ namespace KaleidoScope {
       int this_char = last_char;
       last_char = read();
       return this_char;
+    }
+
+    std::unique_ptr<ExprAST> parse_if() {
+      get_next_token();
+
+      std::unique_ptr<ExprAST> cond = parse_expression();
+
+      if (!cond) {
+        log("Error: cannot parse condition");
+        return nullptr;
+      }
+
+      if (current_token != tok_then) {
+        log("Error: Expecting then token, found: %d, input: %s", current_token, input.c_str());
+        return nullptr;
+      }
+
+      get_next_token();
+
+      std::unique_ptr<ExprAST> then = parse_expression();
+
+      if (current_token != tok_else) {
+        log("Error: Expecting else token");
+        return nullptr;
+      }
+
+      get_next_token();
+
+      std::unique_ptr<ExprAST> otherwise = parse_expression();
+
+      return std::make_unique<IfExprAST>(std::move(cond), std::move(then), std::move(otherwise));
+    }
+
+    std::unique_ptr<ExprAST> parse_for() {
+      get_next_token();
+
+      if (current_token != tok_identifier) {
+        log("Error: expecting an identifier");
+        return nullptr;
+      }
+
+      std::string loop_idx = input;
+      get_next_token();
+
+      if (current_token != '=') {
+        log("Error: Expecting an =");
+        return nullptr;
+      }
+      get_next_token();
+
+      std::unique_ptr<ExprAST> start = parse_expression();
+      if (!start) {
+        log("Error: Cannot parse for start");
+        return nullptr;
+      }
+      if (current_token != ',') {
+        log("Error: Expecting a ,");
+        return nullptr;
+      }
+      get_next_token();
+
+      std::unique_ptr<ExprAST> end = parse_expression();
+      if (!end) {
+        log("Error: Cannot parse for end");
+        return nullptr;
+      }
+      if (current_token != ',') {
+        log("Error: Expecting a ,");
+        return nullptr;
+      }
+      get_next_token();
+
+      std::unique_ptr<ExprAST> step = parse_expression();
+
+      if (!step) {
+        log("Error: Cannot parse for end");
+        return nullptr;
+      }
+
+      if (current_token != tok_in) {
+        log("Error: Expecting an in");
+        return nullptr;
+      }
+
+      get_next_token();
+
+      std::unique_ptr<ExprAST> body = parse_expression();
+
+      if (!body) {
+        log("Error: Cannot parse for body");
+        return nullptr;
+      }
+
+      return std::make_unique<ForExprAST>(loop_idx,
+                                          std::move(start),
+                                          std::move(end),
+                                          std::move(step),
+                                          std::move(body));
     }
 
     std::unique_ptr<ExprAST> parse_number() {
@@ -596,6 +904,12 @@ namespace KaleidoScope {
         }
         case tok_number: {
           return parse_number();
+        }
+        case tok_if: {
+          return parse_if();
+        }
+        case tok_for: {
+          return parse_for();
         }
         case '(': {
           return parse_parenthesis();

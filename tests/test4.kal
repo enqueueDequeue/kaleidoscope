@@ -1,0 +1,2 @@
+extern print(a);
+def test(n) for i = 0, i < n, 1 in if i < 5 then print(2 * i) else print(3 * i);
